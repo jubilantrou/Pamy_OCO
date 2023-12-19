@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+
+import sys, time, logging
+import signal_handler, o80, o80_pam, pam_mujoco, context
+from pam_mujoco import mirroring
+from lightargs import BrightArgs, Set, Range, Positive, FileExists
+import tennicam_client
+
+import numpy as np
+
+SEGMENT_ID_ROBOT_MIRROR = "simulated_robot"
+SEGMENT_ID_TENNICAM = "tennicam_client"
+MUJOCO_ID_MIRRORING = "mirroring"
+
+
+def configure():
+    config = BrightArgs(
+        "pam mirroring: having an instance of pam_mujoco mirroring another robot"
+    )
+    config.add_option(
+        "robot_type",
+        str(pam_mujoco.RobotType.PAMY2),
+        "type of the robot, pamy1 ({}) or pamy2 ({})".format(
+            str(pam_mujoco.RobotType.PAMY1), str(pam_mujoco.RobotType.PAMY2)
+        ),
+        str,
+    )
+    config.add_option(
+        "segment_id_real_robot",
+        o80_pam.segment_ids.robot,
+        "segment_id of the robot that should be mirrored",
+        str,
+    )
+    config.add_option(
+        "mujoco_id_mirroring",
+        MUJOCO_ID_MIRRORING,
+        "mujoco_id of the pam_mujoco instance that will mirror the other robot",
+        str,
+    )
+    config.add_option(
+        "segment_id_tennicam",
+        SEGMENT_ID_TENNICAM,
+        "set to 'None' if you do not want to mirror the tennicam ball",
+        str,
+    )
+    config.add_option("frequency", 300, "mirroring frequency", float, [Positive()])
+    config.add_option(
+        "shoot_ball",
+        False,
+        "if True, virtual balls will be shot toward the racket",
+        bool,
+    )
+    config.add_option(
+        "ball_period", 5, "period at which balls will be shot", int, [Positive()]
+    )
+
+    change_all = False
+    config.dialog(change_all, sys.argv[1:])
+
+    if config.robot_type not in [
+        str(pam_mujoco.RobotType.PAMY1),
+        str(pam_mujoco.RobotType.PAMY2),
+    ]:
+        print(
+            "\nERROR:only values accepted for robot type: {} or {}\n".format(
+                str(pam_mujoco.RobotType.PAMY1), str(pam_mujoco.RobotType.PAMY2)
+            )
+        )
+        return configure()
+
+    if config.segment_id_tennicam == "None":
+        config.segment_id_tennicam = None
+    else:
+        if config.shoot_ball:
+            print(
+                "Error: can not both shoot virtuals balls and mirror tennicam, please disable one of them"
+            )
+            return configure()
+
+    if config.robot_type == str(pam_mujoco.RobotType.PAMY1):
+        config.robot_type = pam_mujoco.RobotType.PAMY1
+    if config.robot_type == str(pam_mujoco.RobotType.PAMY2):
+        config.robot_type = pam_mujoco.RobotType.PAMY2
+
+    print()
+    return config
+
+
+def configure_simulation(
+    robot_type,
+    mujoco_id=MUJOCO_ID_MIRRORING,
+    segment_id=SEGMENT_ID_ROBOT_MIRROR,
+    graphics=True,
+    use_ball=False,
+    segment_id_tennicam=None,
+):
+    accelerated_time = False
+    burst_mode = False
+
+    robot = pam_mujoco.MujocoRobot(
+        robot_type, segment_id, control=pam_mujoco.MujocoRobot.JOINT_CONTROL
+    )
+
+    table = None
+    balls = []
+
+    if use_ball:
+        table = pam_mujoco.MujocoTable("table")
+        ball = pam_mujoco.MujocoItem(
+            "ball",
+            control=pam_mujoco.MujocoItem.CONSTANT_CONTROL,
+            contact_type=pam_mujoco.ContactTypes.racket1,
+        )
+        balls = (ball,)
+
+    if segment_id_tennicam:
+        ball = pam_mujoco.MujocoItem(
+            "ball",
+            control=pam_mujoco.MujocoItem.CONSTANT_CONTROL,
+            color=(0.8, 1, 0.8, 1),
+        )
+        table = pam_mujoco.MujocoTable("table")
+        balls = (ball,)
+
+    handle = pam_mujoco.MujocoHandle(
+        mujoco_id,
+        graphics=graphics,
+        accelerated_time=accelerated_time,
+        burst_mode=burst_mode,
+        robot1=robot,
+        balls=balls,
+        table=table,
+    )
+
+    return handle
+
+
+class BallManager:
+    def __init__(self, handle, period):
+        self._handle = handle
+        self._ball_interface = handle.interfaces["ball"]
+        self._period = period
+        self._last_ball = time.time()
+        self._trajectory_reader = context.BallTrajectories()
+
+    def perform(self):
+        t = time.time()
+        if t - self._last_ball < self._period:
+            return
+        self._last_ball = t
+        _, trajectory_points = self._trajectory_reader.random_trajectory()
+        self._ball_interface.play_trajectory(trajectory_points, overwrite=True)
+        self._handle.reset_contact("ball")
+
+
+class Tennicam:
+    def __init__(
+        self,
+        tennicam_segment_id,
+        handle,
+    ):
+        self._tennicam_frontend = tennicam_client.FrontEnd(tennicam_segment_id)
+        self._ball = handle.frontends["ball"]
+
+    def perform(self):
+        ball_zmq = self._tennicam_frontend.latest()
+        position = ball_zmq.get_position()
+        velocity = ball_zmq.get_velocity()
+        self._ball.add_command(position, velocity, o80.Mode.OVERWRITE)
+        self._ball.pulse()
+
+
+def run():
+    config = configure()
+    use_ball = config.shoot_ball
+    ball_period = config.ball_period
+    segment_id_tennicam = config.segment_id_tennicam
+
+    log_handler = logging.StreamHandler(sys.stdout)
+    logging.basicConfig(
+        format="[pam mirroring {} {}] %(message)s".format(
+            config.segment_id_real_robot, config.mujoco_id_mirroring
+        ),
+        level=logging.DEBUG,
+        handlers=[log_handler],
+    )
+
+    logging.info(
+        "creating o80 frontend to the robot to mirror: {}".format(
+            config.segment_id_real_robot
+        )
+    )
+    pressures = o80_pam.o80Pressures(config.segment_id_real_robot)
+
+    logging.info(
+        "creating o80 frontend to the mirroring robot (use_ball): {} ({})".format(
+            config.mujoco_id_mirroring, use_ball
+        )
+    )
+
+    mirroring_handle = configure_simulation(
+        config.robot_type,
+        mujoco_id=config.mujoco_id_mirroring,
+        use_ball=use_ball,
+        segment_id_tennicam=segment_id_tennicam,
+    )
+    joints = mirroring_handle.interfaces[SEGMENT_ID_ROBOT_MIRROR]
+    frontend = mirroring_handle.frontends[SEGMENT_ID_ROBOT_MIRROR]
+
+    if use_ball:
+        logging.info("creating ball manager (shooting virtual balls)")
+        ball_manager = BallManager(mirroring_handle, ball_period)
+    elif segment_id_tennicam:
+        logging.info("creaing ball manager (tennicam mirroring)")
+        ball_manager = Tennicam(segment_id_tennicam, mirroring_handle)
+    else:
+        ball_manager = None
+
+    logging.info("creating frequency manager")
+    frequency_manager = o80.FrequencyManager(config.frequency)
+
+    logging.info("starting")
+
+    signal_handler.init()  # for detecting ctrl+c
+    dof = 3
+    position = np.array([])
+    iter_stamp = np.array([])
+    try:
+        while not signal_handler.has_received_sigint():
+            try:
+                _, __, joint_positions, joint_velocities = pressures.read()
+                # print(
+                #    "{:.2f} {:.2f} {:.2f} | {:.2f} {:.2f} {:.2f}".format(
+                #        *joint_positions, *joint_velocities
+                #    )
+                # )
+                joints.set(
+                    joint_positions, joint_velocities, duration_ms=None, wait=False
+                )
+                if ball_manager:
+                    ball_manager.perform()
+
+                observation = frontend.latest()
+                obs_position = observation.get_positions()
+
+                position = np.append(position, obs_position[dof])
+                iter_stamp = np.append(iter_stamp, pressures._frontend.latest().get_iteration())
+
+            except Exception as e:
+                logging.info("exception: {}. keyboard interrupt ? ".format(e))
+                break
+            frequency_manager.wait()
+    except KeyboardInterrupt:
+        logging.info("keyboard interrupt, exiting")
+
+    logging.info("exit")
+    f_output = '/home/mtian/Pamy_OCO/excitation signals/mirroring_sim_dof_' + str(dof) + '.txt'
+    logging.info("begin to write data to the file...")
+    f = open(f_output, 'w')
+    np.savetxt(f, iter_stamp,       fmt='%.1f')
+    np.savetxt(f, position,         fmt='%.8f')
+    f.close()
+    logging.info('...completed')
+    print()
+
+
+if __name__ == "__main__":
+    run()
